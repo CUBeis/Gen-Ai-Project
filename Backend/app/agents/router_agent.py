@@ -14,21 +14,14 @@ Returns a RouterResult with:
 from __future__ import annotations
 
 import json
-from enum import Enum
 
 from groq import AsyncGroq
 
 from app.agents.base import BaseAgent, llm_retry
+from app.agents.intents import IntentType
 from app.core.exceptions import RouterAgentError
-
-
-# ── Intent taxonomy ────────────────────────────────────────────────────────────
-class IntentType(str, Enum):
-    ONBOARDING         = "onboarding"
-    CARE_PLAN_UPDATE   = "care_plan_update"
-    CLINICAL_QUESTION  = "clinical_question"
-    IMAGE_ANALYSIS     = "image_analysis"
-    GENERAL_CHAT       = "general_chat"
+from app.llm.provider_utils import groq_configured
+from app.orchestrator.intent_heuristics import classify_intent_heuristic
 
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
@@ -70,7 +63,8 @@ class RouterAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        self._client = AsyncGroq(api_key=self.settings.GROQ_API_KEY)
+        self._use_groq = groq_configured()
+        self._client = AsyncGroq(api_key=self.settings.GROQ_API_KEY) if self._use_groq else None
         self._model  = self.settings.GROQ_ROUTER_MODEL
 
     async def run(
@@ -118,6 +112,14 @@ class RouterAgent(BaseAgent):
         message: str,
         history: list[dict],
     ) -> RouterResult:
+        if not self._use_groq:
+            intent, confidence, language = classify_intent_heuristic(message)
+            return RouterResult(
+                intent=IntentType(intent),
+                confidence=confidence,
+                language=language,
+            )
+
         # Use the last 3 exchanges for routing context (cheap + effective)
         context = history[-6:] if len(history) >= 6 else history
 

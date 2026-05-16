@@ -45,3 +45,4 @@ export interface WebSocketEvent {
 
 export type Direction = 'ltr' | 'rtl';
 export type Language = 'en' | 'ar';
+export type AppView = 'Dashboard' | 'Chat' | 'Care Plan' | 'Settings';

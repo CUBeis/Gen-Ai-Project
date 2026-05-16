@@ -6,7 +6,7 @@ Add every new route module here.
 """
 from fastapi import APIRouter
 
-from app.api.v1 import auth, care_plan, chat, onboarding, patient, vision
+from app.api.v1 import auth, care_plan, chat, onboarding, patient, vision, workflow
 
 api_router = APIRouter()
 
@@ -50,4 +50,11 @@ api_router.include_router(
     vision.router,
     prefix="/vision",
     tags=["Vision"],
+)
+
+# ── Workflow (professor / demo) ───────────────────────────────────────────────
+api_router.include_router(
+    workflow.router,
+    prefix="/workflow",
+    tags=["Workflow"],
 )

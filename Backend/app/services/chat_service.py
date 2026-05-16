@@ -86,4 +86,6 @@ class ChatService:
             care_plan_updated=state.care_plan_updated,
             was_sanitized=state.was_sanitized,
             was_blocked=state.was_blocked,
+            workflow_trace_id=state.workflow_trace_id,
+            workflow_steps=state.workflow_steps,
         )

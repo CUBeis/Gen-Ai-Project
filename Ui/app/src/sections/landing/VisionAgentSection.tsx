@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { fadeInUp, fadeInScale } from '@/lib/animations';
+import { fadeInUp } from '@/lib/animations';
 
 const capabilities = [
   'Medical image analysis and interpretation',

@@ -5,22 +5,22 @@ python-multipart==0.0.9          # file uploads
 websockets==12.0
 
 # ─── Data Validation ──────────────────────────────────────────────────────────
-pydantic==2.7.4
-pydantic-settings==2.3.4
+pydantic>=2.7.4,<3
+pydantic-settings>=2.3.4
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 sqlalchemy[asyncio]==2.0.31
-asyncpg==0.29.0                  # async PostgreSQL driver
+asyncpg>=0.30.0                  # async PostgreSQL driver (0.30+ for Python 3.13)
 alembic==1.13.2
 
 # ─── Redis / Cache / Celery ───────────────────────────────────────────────────
 redis==5.0.7
-hiredis==2.3.2
+hiredis>=2.3.2                   # optional speedup; skip if build fails on Windows
 celery==5.4.0
 flower==2.0.1                    # Celery monitoring UI
 
 # ─── Vector DB ────────────────────────────────────────────────────────────────
-chromadb==0.5.3
+chromadb>=1.5.0,<2.0.0           # 0.5.x fails on Python 3.13 (numpy<2 build)
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
@@ -32,12 +32,13 @@ google-generativeai==0.7.2       # Gemini 1.5 Flash
 cohere==5.6.2                    # Command R
 
 # ─── RAG / AI Tooling ─────────────────────────────────────────────────────────
-langchain==0.2.12
-langchain-community==0.2.11
-langchain-experimental==0.0.63
-langchain-text-splitters==0.2.2
+langchain>=0.3.0                 # 0.2.x pins numpy<2 (breaks Python 3.13 on Windows)
+langchain-community>=0.3.0
+langchain-experimental>=0.3.0
+langchain-text-splitters>=0.3.0
 sentence-transformers==3.0.1     # cross-encoder reranker (local)
-pymupdf==1.24.9                  # PDF loading (fitz)
+pymupdf>=1.25.5                  # PDF loading — use wheel build (1.24.9 fails on Py3.13+Windows)
+rank-bm25==0.2.2                 # hybrid retrieval (synced from Rag/)
 
 # ─── HTTP Client ──────────────────────────────────────────────────────────────
 httpx==0.27.0

@@ -33,3 +33,21 @@ class CarePlanResponse(CarePlanBase):
 
     class Config:
         from_attributes = True
+
+
+class CarePlanUpdateRequest(BaseModel):
+    action: str
+    activity: Optional[dict] = None
+    activities: Optional[List[Activity]] = None
+    title: Optional[str] = None
+
+
+class CarePlanUpdateResponse(BaseModel):
+    care_plan: CarePlanResponse
+    message: str = "Care plan updated"
+
+
+class ActivityToggleResponse(BaseModel):
+    activity_id: str
+    completed_today: bool
+    care_plan: CarePlanResponse

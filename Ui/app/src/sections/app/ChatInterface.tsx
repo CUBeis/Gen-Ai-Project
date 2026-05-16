@@ -10,7 +10,8 @@ import { QuickActionChip } from '@/components/QuickActionChip';
 import { SkeletonLoader } from '@/components/SkeletonLoader';
 import { TopBar } from './TopBar';
 import { cn } from '@/lib/utils';
-import { mockAIResponses, quickActions, welcomeMessage } from '@/data/mockData';
+import { quickActions, welcomeMessage } from '@/data/mockData';
+import { checkBackendHealth, getApiBaseUrl, sendDemoChatMessage } from '@/lib/api';
 
 export function ChatInterface() {
   const { isRTL } = useDirection();
@@ -18,13 +19,31 @@ export function ChatInterface() {
   const isTyping = useAppStore((s) => s.isTyping);
   const addMessage = useAppStore((s) => s.addMessage);
   const setTyping = useAppStore((s) => s.setTyping);
+  const addToast = useAppStore((s) => s.addToast);
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [isSending, setIsSending] = useState(false);
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const sessionIdRef = useRef(
+    localStorage.getItem('nerve-demo-session-id') || `ui-demo-${Date.now()}`
+  );
   const { ref: scrollRef } = useAutoScroll<HTMLDivElement>([messages.length, isTyping]);
 
-  // Initial load
+  // Initial load + backend health check
   useEffect(() => {
+    localStorage.setItem('nerve-demo-session-id', sessionIdRef.current);
+
+    void checkBackendHealth().then((ok) => {
+      setBackendOnline(ok);
+      if (!ok) {
+        addToast({
+          message: `Backend offline. Run: uvicorn main:app --reload --port 8000 (expected at ${getApiBaseUrl()})`,
+          type: 'warning',
+        });
+      }
+    });
+
     const timer = setTimeout(() => {
       if (messages.length === 0) {
         addMessage({ ...welcomeMessage, id: `welcome-${Date.now()}` });
@@ -34,29 +53,46 @@ export function ChatInterface() {
     return () => clearTimeout(timer);
   }, []);
 
-  const simulateAIResponse = useCallback(
-    (userContent: string) => {
+  const requestAIResponse = useCallback(
+    async (userContent: string) => {
       setTyping(true);
-      const responseText = mockAIResponses[userContent] || mockAIResponses['default'];
-      const delay = Math.min(800 + responseText.length * 12, 3000);
+      setIsSending(true);
 
-      setTimeout(() => {
+      try {
+        const response = await sendDemoChatMessage(sessionIdRef.current, userContent);
         setTyping(false);
         addMessage({
           id: `ai-${Date.now()}`,
           sender: 'ai',
-          content: responseText,
+          content: response.response_text,
           timestamp: new Date(),
           type: 'text',
         });
-      }, delay);
+      } catch (error) {
+        setTyping(false);
+        addToast({
+          message: 'The backend chat endpoint did not respond. Check the API server and try again.',
+          type: 'warning',
+        });
+        addMessage({
+          id: `ai-error-${Date.now()}`,
+          sender: 'ai',
+          content:
+            `I couldn't reach the local AI pipeline. Start the backend (uvicorn main:app --reload --port 8000) — UI expects ${getApiBaseUrl()}.`,
+          timestamp: new Date(),
+          type: 'text',
+        });
+        console.error(error);
+      } finally {
+        setIsSending(false);
+      }
     },
-    [addMessage, setTyping]
+    [addMessage, addToast, setTyping]
   );
 
   const handleSend = useCallback(() => {
     const trimmed = inputValue.trim();
-    if (!trimmed) return;
+    if (!trimmed || isSending) return;
 
     // Add user message
     addMessage({
@@ -73,9 +109,8 @@ export function ChatInterface() {
       textareaRef.current.focus();
     }
 
-    // Simulate AI response
-    simulateAIResponse(trimmed);
-  }, [inputValue, addMessage, simulateAIResponse]);
+    void requestAIResponse(trimmed);
+  }, [inputValue, isSending, addMessage, requestAIResponse]);
 
   const handleQuickAction = useCallback(
     (label: string) => {
@@ -86,9 +121,9 @@ export function ChatInterface() {
         timestamp: new Date(),
         type: 'text',
       });
-      simulateAIResponse(label);
+      void requestAIResponse(label);
     },
-    [addMessage, simulateAIResponse]
+    [addMessage, requestAIResponse]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -109,6 +144,19 @@ export function ChatInterface() {
   return (
     <div className="flex flex-col h-screen bg-nerve-bg flex-1 min-w-0">
       <TopBar />
+
+      {backendOnline === false && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mx-4 mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+        >
+          <strong>Backend not connected.</strong> Start FastAPI on port 8000, then refresh this page.
+          <span className="block text-xs text-amber-800 mt-1 font-mono">
+            cd Backend → uvicorn main:app --reload --port 8000
+          </span>
+        </motion.div>
+      )}
 
       {/* Messages Area */}
       <div
@@ -208,10 +256,10 @@ export function ChatInterface() {
           <motion.button
             whileTap={{ scale: 0.9 }}
             onClick={handleSend}
-            disabled={!inputValue.trim()}
+            disabled={!inputValue.trim() || isSending}
             className={cn(
               'w-10 h-10 rounded-full flex items-center justify-center transition-all duration-200 shrink-0 mb-0.5',
-              inputValue.trim()
+              inputValue.trim() && !isSending
                 ? 'bg-nerve-green text-white hover:bg-nerve-green-light hover:shadow-[0_2px_12px_rgba(77,105,78,0.3)]'
                 : 'bg-nerve-bg-secondary text-nerve-muted opacity-40'
             )}

@@ -1,10 +1,11 @@
 import { create } from 'zustand';
-import type { Message, ScheduleItem, Medication, Insight, Toast, Direction, Language } from '@/types';
+import type { Message, ScheduleItem, Medication, Insight, Toast, Direction, Language, AppView } from '@/types';
 
 interface AppState {
   direction: Direction;
   language: Language;
   sidebarCollapsed: boolean;
+  activeView: AppView;
   messages: Message[];
   isTyping: boolean;
   schedule: ScheduleItem[];
@@ -16,6 +17,7 @@ interface AppState {
   toggleDirection: () => void;
   setLanguage: (lang: Language) => void;
   toggleSidebar: () => void;
+  setActiveView: (view: AppView) => void;
   addMessage: (msg: Message) => void;
   setTyping: (typing: boolean) => void;
   clearChat: () => void;
@@ -35,6 +37,7 @@ export const useAppStore = create<AppState>((set) => ({
   direction: 'ltr',
   language: 'en',
   sidebarCollapsed: false,
+  activeView: 'Chat',
   messages: [],
   isTyping: false,
   schedule: [],
@@ -61,6 +64,8 @@ export const useAppStore = create<AppState>((set) => ({
     }),
 
   toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
+
+  setActiveView: (view) => set({ activeView: view }),
 
   addMessage: (msg) => set((state) => ({ messages: [...state.messages, msg] })),
 

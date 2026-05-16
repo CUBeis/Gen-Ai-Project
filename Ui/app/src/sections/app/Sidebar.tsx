@@ -7,13 +7,15 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { slideInLeft } from '@/lib/animations';
 import { useSidebar } from '@/hooks/useSidebar';
 import { NavLink } from '@/components/NavLink';
 import { cn } from '@/lib/utils';
-import { useState } from 'react';
+import { useAppStore } from '@/store/useAppStore';
+import type { AppView } from '@/types';
 
-const navItems = [
+const navItems: { icon: LucideIcon; label: AppView }[] = [
   { icon: LayoutDashboard, label: 'Dashboard' },
   { icon: MessageSquare, label: 'Chat' },
   { icon: HeartPulse, label: 'Care Plan' },
@@ -22,7 +24,8 @@ const navItems = [
 
 export function Sidebar() {
   const { collapsed, toggleSidebar } = useSidebar();
-  const [activeItem, setActiveItem] = useState('Chat');
+  const activeView = useAppStore((s) => s.activeView);
+  const setActiveView = useAppStore((s) => s.setActiveView);
 
   return (
     <motion.aside
@@ -66,9 +69,9 @@ export function Sidebar() {
             key={item.label}
             icon={item.icon}
             label={item.label}
-            active={activeItem === item.label}
+            active={activeView === item.label}
             collapsed={collapsed}
-            onClick={() => setActiveItem(item.label)}
+            onClick={() => setActiveView(item.label)}
           />
         ))}
       </nav>
