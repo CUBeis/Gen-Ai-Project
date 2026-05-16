@@ -9,6 +9,18 @@ export default defineConfig({
   plugins: [inspectAttr(), react()],
   server: {
     port: 3000,
+    host: true,
+    proxy: {
+      // Avoid CORS issues: browser calls same origin, Vite forwards to FastAPI
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
   },
   resolve: {
     alias: {

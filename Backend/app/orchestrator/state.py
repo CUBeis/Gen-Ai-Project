@@ -52,6 +52,10 @@ class ConversationState:
     was_sanitized:  bool = False
     was_blocked:    bool = False
 
+    # ── Workflow tracking (professor / demo visibility) ───────────────────────
+    workflow_trace_id: Optional[str] = None
+    workflow_steps:    list[dict]    = field(default_factory=list)
+
     # ── Convenience properties ────────────────────────────────────────────────
     @property
     def has_image(self) -> bool:
@@ -71,4 +75,6 @@ class ConversationState:
             "care_plan_patch":    self.care_plan_patch,
             "was_sanitized":      self.was_sanitized,
             "was_blocked":        self.was_blocked,
+            "workflow_trace_id":  self.workflow_trace_id,
+            "workflow_steps":     self.workflow_steps,
         }

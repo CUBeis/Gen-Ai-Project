@@ -34,7 +34,7 @@ class PatientCreate(PatientBase):
     user_id: uuid.UUID
 
 
-class PatientUpdate(BaseModel):
+class PatientUpdateRequest(BaseModel):
     """Partial patient profile update."""
     full_name: Optional[str] = None
     date_of_birth: Optional[date] = None
@@ -44,6 +44,10 @@ class PatientUpdate(BaseModel):
     chronic_conditions: Optional[list[str]] = None
     emergency_contact: Optional[dict[str, Any]] = None
     onboarding_complete: Optional[bool] = None
+
+
+# Backward-compatible alias
+PatientUpdate = PatientUpdateRequest
 
 
 class PatientResponse(PatientBase):

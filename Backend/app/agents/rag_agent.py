@@ -1,19 +1,14 @@
 """
 app/agents/rag_agent.py
 ────────────────────────
-Clinical RAG Agent — answers medical questions with grounded retrieval.
+Clinical RAG Agent — synced with Rag/ folder pipeline.
 
 Pipeline per query:
-  1. Query Reformulation  — resolve pronouns using session context (Gemini)
-  2. Parallel Retrieval   — clinical knowledge + patient episodic memory (ChromaDB)
-  3. Reranking            — cross-encoder filters top-K down to top-N
-  4. Augmented Generation — Gemini answers using ONLY retrieved context
-  5. Source Attribution   — returns which documents were used
-
-Model    : Gemini 1.5 Flash
-Embedder : all-MiniLM-L6-v2 (local sidecar via HTTP)
-Vector DB: ChromaDB (persistent local)
-Reranker : cross-encoder/ms-marco-MiniLM-L-6-v2 (local CPU)
+  1. Multilingual     — translate to English for retrieval when needed
+  2. Query Reformulation — primary LLM (OpenRouter / Gemini)
+  3. Hybrid Retrieval — Cohere embed + BM25 + MMR + Cohere rerank (medical_rag)
+  4. Patient memory   — ChromaDB episodic memory
+  5. Augmented Generation — primary LLM (answer in patient language)
 """
 from __future__ import annotations
 
@@ -23,138 +18,194 @@ from typing import Optional
 
 import google.generativeai as genai
 import httpx
+import structlog
 
 from app.agents.base import BaseAgent, llm_retry
+from app.core.config import settings
 from app.core.exceptions import RAGAgentError, EmbeddingServiceError
+from app.llm.factory import get_chat_llm, primary_llm_model_name
+from app.rag.multilingual.translator import MultilingualLayer
+from app.rag.retrieval.hybrid_retriever import HybridClinicalRetriever
+from app.rag.retrieval.retriever import ClinicalRetriever, SearchResult
+
+logger = structlog.get_logger(__name__)
 
 
-# ── Data structures ────────────────────────────────────────────────────────────
 @dataclass
 class RetrievedChunk:
-    text:            str
-    source:          str
-    page:            Optional[int]
+    text: str
+    source: str
+    page: Optional[int]
     relevance_score: float
-    rerank_score:    float = 0.0
+    rerank_score: float = 0.0
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class RAGResult:
-    answer:  str
-    sources: list[dict]           # [{"source": "...", "page": N}]
+    answer: str
+    sources: list[dict]
     reformulated_query: str
+    english_query: str = ""
+    was_translated: bool = False
 
 
-# ── System prompt ──────────────────────────────────────────────────────────────
 _ANSWER_SYSTEM = """You are a clinical medical assistant AI for Nerve AI.
 
 STRICT RULES:
-1. Answer ONLY using the retrieved medical context and the patient's own medical record provided below.
-2. If the answer is NOT in the provided context, say exactly: "I don't have sufficient clinical information on this topic. Please consult your physician directly."
+1. Answer ONLY using the retrieved medical context and the patient's medical record.
+2. If the answer is NOT in the context, say you don't have sufficient clinical information.
 3. NEVER fabricate drug names, dosages, or medical facts.
-4. NEVER say "you should take X mg" — dosage decisions belong to the physician.
-5. NEVER diagnose the patient.
-6. If information seems contradictory, present both perspectives and recommend consulting a doctor.
-7. End EVERY response about medications or symptoms with the safety disclaimer provided.
+4. NEVER diagnose the patient.
+5. End medication/symptom responses with a brief safety disclaimer in the same language as the answer.
 
-RESPONSE FORMAT:
-- Answer clearly in the patient's language.
-- Reference the source material naturally ("According to clinical guidelines...", "Medical literature indicates...").
-- Keep responses focused and not excessively long (3–5 paragraphs max).
-- Always end with: ⚕️ *This information is for educational purposes only. Always consult your physician before making any medical decisions.*"""
+Do not switch languages for the disclaimer."""
 
-_REFORMULATION_PROMPT = """Given this recent conversation history and a follow-up question, 
-rewrite the question as a complete, standalone medical search query.
-Resolve all pronouns and references. Do NOT answer the question — only rewrite it.
-Return ONLY the rewritten query, nothing else.
+_REFORMULATION_PROMPT = """Given this conversation history and a follow-up question,
+rewrite the question as a complete, standalone medical search query in English.
+Resolve pronouns. Return ONLY the rewritten query.
 
 Conversation:
 {history}
 
 Follow-up question: {question}
 
-Standalone query:"""
+Standalone English query:"""
 
 
-# ── Agent ──────────────────────────────────────────────────────────────────────
 class ClinicalRAGAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        genai.configure(api_key=self.settings.GEMINI_API_KEY)
-        self._llm            = genai.GenerativeModel(self.settings.GEMINI_MODEL)
-        self._embed_url      = self.settings.EMBEDDING_SERVICE_URL
-        self._chroma_path    = self.settings.CHROMA_PATH
-        self._clinical_col   = self.settings.CHROMA_CLINICAL_COLLECTION
-        self._memory_col     = self.settings.CHROMA_MEMORY_COLLECTION
-        self._top_k          = self.settings.RAG_TOP_K
-        self._rerank_top_n   = self.settings.RAG_RERANK_TOP_N
-        self._reranker       = None   # lazy-loaded (heavy import)
-        self._chroma_client  = None   # lazy-loaded
+        self._llm = get_chat_llm()
+        self._multilingual = MultilingualLayer(self._llm)
+        self._hybrid: Optional[HybridClinicalRetriever] = None
+        self._legacy_retriever = ClinicalRetriever()
+        self._chroma_path = settings.CHROMA_PATH
+        self._memory_col = settings.CHROMA_MEMORY_COLLECTION
+        self._chroma_client = None
+        self._gemini = None
+        if settings.RAG_LLM_PROVIDER == "gemini" and settings.GEMINI_API_KEY:
+            genai.configure(api_key=settings.GEMINI_API_KEY)
+            self._gemini = genai.GenerativeModel(settings.GEMINI_MODEL)
+
+    def _get_hybrid(self) -> HybridClinicalRetriever:
+        if self._hybrid is None:
+            self._hybrid = HybridClinicalRetriever()
+        return self._hybrid
 
     async def run(
         self,
-        user_message:    str,
+        user_message: str,
         session_history: list[dict],
         patient_context: dict,
-        patient_id:      str,
-        language:        str = "en",
+        patient_id: str,
+        language: str = "en",
+        workflow_trace_id: Optional[str] = None,
     ) -> RAGResult:
-        """
-        Full RAG pipeline for a clinical question.
+        from app.tracking.workflow_tracker import workflow_tracker
 
-        Args:
-            user_message    : Raw patient question.
-            session_history : Short-term memory for reformulation context.
-            patient_context : Structured patient data from PostgreSQL.
-            patient_id      : Used to filter patient-specific memories in ChromaDB.
-            language        : Response language from Router agent.
-        """
-        t0    = self._now_ms()
+        t0 = self._now_ms()
         trace = self._start_trace("rag_agent", {"question": user_message[:200]})
 
-        # Step 1 — Reformulate query
-        reformulated = await self._reformulate(user_message, session_history)
-        self.logger.debug("rag.reformulated", original=user_message[:100], reformulated=reformulated[:100])
+        def _wf(name: str, **kwargs):
+            if workflow_trace_id:
+                workflow_tracker.step(workflow_trace_id, name, **kwargs)
 
-        # Step 2 — Embed reformulated query
-        query_embedding = await self._embed(reformulated)
-
-        # Step 3 — Parallel retrieval from both collections
-        clinical_chunks, memory_chunks = await asyncio.gather(
-            self._retrieve_clinical(query_embedding),
-            self._retrieve_patient_memory(query_embedding, patient_id),
+        # Step 1 — Multilingual preprocessing
+        t1 = self._now_ms()
+        translation = await self._multilingual.to_english(user_message, language)
+        english_message = translation.english_text
+        _wf(
+            "multilingual_translate",
+            duration_ms=self._elapsed(t1),
+            input_summary={"original": user_message[:120], "language": language},
+            output_summary={
+                "english": english_message[:120],
+                "was_translated": translation.was_translated,
+            },
         )
-        all_chunks = clinical_chunks + memory_chunks
-        self.logger.debug("rag.retrieved", clinical=len(clinical_chunks), memory=len(memory_chunks))
 
-        # Step 4 — Rerank
-        reranked = self._rerank(reformulated, all_chunks)
-        self.logger.debug("rag.reranked", kept=len(reranked))
+        # Step 2 — Reformulate
+        t2 = self._now_ms()
+        reformulated = await self._reformulate(english_message, session_history)
+        _wf(
+            "query_reformulation",
+            duration_ms=self._elapsed(t2),
+            input_summary={"query": english_message[:120]},
+            output_summary={"reformulated": reformulated[:120]},
+        )
 
-        # Step 5 — Generate grounded answer
-        answer = await self._generate(reformulated, reranked, patient_context, language)
+        # Step 3 — Retrieve clinical knowledge
+        t3 = self._now_ms()
+        if settings.RAG_USE_COHERE_EMBEDDINGS and settings.RAG_USE_HYBRID_RETRIEVAL:
+            try:
+                clinical_results = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._get_hybrid().retrieve(reformulated),
+                )
+            except Exception as exc:
+                self.logger.warning("rag.hybrid_failed_fallback", error=str(exc))
+                clinical_results = await self._legacy_retriever.search_clinical(reformulated)
+        else:
+            clinical_results = await self._legacy_retriever.search_clinical(reformulated)
+
+        memory_results = await self._retrieve_patient_memory(reformulated, patient_id)
+        _wf(
+            "hybrid_retrieval",
+            duration_ms=self._elapsed(t3),
+            output_summary={
+                "clinical_chunks": len(clinical_results),
+                "memory_chunks": len(memory_results),
+                "collection": settings.RAG_MEDICAL_COLLECTION,
+            },
+        )
+
+        all_chunks = self._merge_results(clinical_results, memory_results)
+
+        # Step 4 — Generate
+        t4 = self._now_ms()
+        answer = await self._generate(
+            query=user_message,
+            english_query=reformulated,
+            chunks=all_chunks,
+            patient_context=patient_context,
+            language=language,
+        )
+        _wf(
+            "llm_generation",
+            duration_ms=self._elapsed(t4),
+            input_summary={"model": primary_llm_model_name(), "chunks": len(all_chunks)},
+            output_summary={"answer_preview": answer[:120]},
+        )
 
         latency = self._elapsed(t0)
         self._log_generation(
-            trace, "rag_generate", self.settings.GEMINI_MODEL,
+            trace, "rag_generate", primary_llm_model_name(),
             prompt=reformulated, completion=answer[:200],
             latency_ms=latency,
         )
-        self.logger.info("rag.done", latency_ms=latency, sources=len(reranked))
 
         sources = [
-            {"source": c.source, "page": c.page}
-            for c in reranked if c.source
+            {
+                "source": c.source,
+                "entity_name": c.metadata.get("entity_name"),
+                "entity_type": c.metadata.get("entity_type"),
+                "score": c.relevance_score,
+                "url": c.metadata.get("url"),
+            }
+            for c in all_chunks
+            if c.source
         ]
 
         return RAGResult(
             answer=answer,
             sources=sources,
             reformulated_query=reformulated,
+            english_query=english_message,
+            was_translated=translation.was_translated,
         )
 
-    # ── Step 1: Reformulation ─────────────────────────────────────────────────
     @llm_retry(max_attempts=2, reraise_as=RAGAgentError)
     async def _reformulate(self, question: str, history: list[dict]) -> str:
         if not history:
@@ -162,170 +213,134 @@ class ClinicalRAGAgent(BaseAgent):
 
         history_text = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
-            for m in history[-6:]   # last 3 turns
+            for m in history[-6:]
         )
+        prompt = _REFORMULATION_PROMPT.format(history=history_text, question=question)
 
-        prompt = _REFORMULATION_PROMPT.format(
-            history=history_text,
-            question=question,
-        )
-
-        response = self._llm.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
+        if settings.primary_llm_enabled:
+            text = await self._llm.chat(
+                [{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_output_tokens=150,
-            ),
-        )
-        reformulated = response.text.strip()
-        # Sanity check — if model returned something weird, fall back
-        return reformulated if len(reformulated) > 5 else question
-
-    # ── Step 2: Embedding ─────────────────────────────────────────────────────
-    async def _embed(self, text: str) -> list[float]:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{self._embed_url}/embed",
-                    json={"texts": [text]},
-                )
-                resp.raise_for_status()
-                return resp.json()["embeddings"][0]
-        except httpx.HTTPError as exc:
-            raise EmbeddingServiceError() from exc
-
-    # ── Step 3a: Clinical knowledge retrieval ─────────────────────────────────
-    async def _retrieve_clinical(self, embedding: list[float]) -> list[RetrievedChunk]:
-        client = self._get_chroma()
-        try:
-            collection = client.get_or_create_collection(self._clinical_col)
-            results = collection.query(
-                query_embeddings=[embedding],
-                n_results=self._top_k,
-                include=["documents", "metadatas", "distances"],
+                max_tokens=150,
             )
-            return self._parse_results(results)
-        except Exception as exc:
-            self.logger.warning("rag.clinical_retrieval_failed", error=str(exc))
-            return []
+            return text if len(text) > 5 else question
 
-    # ── Step 3b: Patient episodic memory retrieval ────────────────────────────
+        if self._gemini:
+            response = self._gemini.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0, max_output_tokens=150,
+                ),
+            )
+            reformulated = response.text.strip()
+            return reformulated if len(reformulated) > 5 else question
+
+        return question
+
     async def _retrieve_patient_memory(
-        self,
-        embedding: list[float],
-        patient_id: str,
+        self, query: str, patient_id: str,
     ) -> list[RetrievedChunk]:
-        client = self._get_chroma()
         try:
-            collection = client.get_or_create_collection(self._memory_col)
-            results = collection.query(
-                query_embeddings=[embedding],
-                n_results=min(5, self._top_k // 2),
-                where={"patient_id": patient_id},    # CRITICAL: patient isolation
-                include=["documents", "metadatas", "distances"],
-            )
-            return self._parse_results(results)
+            results = await self._legacy_retriever.search_patient_memory(query, patient_id, top_k=5)
+            return self._search_results_to_chunks(results)
         except Exception as exc:
             self.logger.warning("rag.memory_retrieval_failed", error=str(exc))
             return []
 
-    # ── Step 4: Reranking ─────────────────────────────────────────────────────
-    def _rerank(self, query: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
-        if not chunks:
-            return []
-
-        reranker = self._get_reranker()
-        pairs = [(query, c.text) for c in chunks]
-
-        try:
-            scores = reranker.predict(pairs)
-            for chunk, score in zip(chunks, scores):
-                chunk.rerank_score = float(score)
-            ranked = sorted(chunks, key=lambda c: c.rerank_score, reverse=True)
-            return ranked[: self._rerank_top_n]
-        except Exception as exc:
-            self.logger.warning("rag.rerank_failed", error=str(exc))
-            # Fall back to relevance score ordering
-            return sorted(chunks, key=lambda c: c.relevance_score, reverse=True)[: self._rerank_top_n]
-
-    # ── Step 5: Augmented generation ──────────────────────────────────────────
     @llm_retry(max_attempts=3, reraise_as=RAGAgentError)
     async def _generate(
         self,
         query: str,
+        english_query: str,
         chunks: list[RetrievedChunk],
         patient_context: dict,
         language: str,
     ) -> str:
         context_text = "\n\n---\n\n".join(
-            f"[Source: {c.source}, page {c.page}]\n{c.text}"
+            f"[Source: {c.source} | {c.metadata.get('entity_name', '')}]\n{c.text}"
             for c in chunks
-        ) if chunks else "No specific clinical documents were retrieved for this query."
+        ) if chunks else "No specific clinical documents were retrieved."
 
         patient_summary = (
             f"Name: {patient_context.get('name', 'Unknown')}\n"
-            f"Age: {patient_context.get('age', 'Unknown')}\n"
-            f"Conditions: {', '.join(patient_context.get('conditions', [])) or 'None reported'}\n"
-            f"Medications: {', '.join(patient_context.get('medications', [])) or 'None reported'}\n"
-            f"Allergies: {', '.join(patient_context.get('allergies', [])) or 'None reported'}"
+            f"Conditions: {', '.join(patient_context.get('conditions', [])) or 'None'}\n"
+            f"Medications: {', '.join(patient_context.get('medications', [])) or 'None'}\n"
+            f"Allergies: {', '.join(patient_context.get('allergies', [])) or 'None'}"
         )
 
-        full_prompt = f"""{_ANSWER_SYSTEM}
+        lang_instruction = _LANG_NAMES.get(language, language)
+        disclaimer_instruction = (
+            "End with this Arabic disclaimer: تنبيه طبي: هذه المعلومات للتثقيف فقط ولا تغني عن استشارة الطبيب قبل اتخاذ أي قرار طبي."
+            if language == "ar"
+            else "End with this disclaimer: ⚕️ *This information is for educational purposes only. Always consult your physician before making any medical decisions.*"
+        )
+
+        user_content = f"""{_ANSWER_SYSTEM}
 
 ## Retrieved Clinical Context:
 {context_text}
 
-## Patient Medical Record:
+## Patient Record:
 {patient_summary}
 
-## Patient Question:
+## Patient Question (original language):
 {query}
 
-## Instructions:
-- Answer in language code: {language}
-- Base your answer strictly on the context above.
-- Reference sources naturally.
-- End with the ⚕️ disclaimer."""
+## Search query used (English):
+{english_query}
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: self._llm.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=1024,
+Answer in {lang_instruction}. Use the context only.
+{disclaimer_instruction}"""
+
+        messages = [
+            {"role": "system", "content": _ANSWER_SYSTEM},
+            {"role": "user", "content": user_content},
+        ]
+
+        if settings.primary_llm_enabled:
+            return await self._llm.chat(messages, temperature=0.2, max_tokens=1024)
+
+        if self._gemini:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._gemini.generate_content(
+                    user_content,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.2, max_output_tokens=1024,
+                    ),
                 ),
-            ),
-        )
-        return response.text.strip()
+            )
+            return response.text.strip()
 
-    # ── Lazy-loaded singletons ─────────────────────────────────────────────────
-    def _get_chroma(self):
-        if self._chroma_client is None:
-            import chromadb
-            self._chroma_client = chromadb.PersistentClient(path=self._chroma_path)
-        return self._chroma_client
+        raise RAGAgentError(detail="No LLM configured for RAG generation.")
 
-    def _get_reranker(self):
-        if self._reranker is None:
-            from sentence_transformers import CrossEncoder
-            self._reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        return self._reranker
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
     @staticmethod
-    def _parse_results(results: dict) -> list[RetrievedChunk]:
-        chunks = []
-        docs      = results.get("documents", [[]])[0]
-        metas     = results.get("metadatas", [[]])[0]
-        distances = results.get("distances",  [[]])[0]
+    def _merge_results(
+        clinical: list[SearchResult],
+        memory: list[RetrievedChunk],
+    ) -> list[RetrievedChunk]:
+        chunks = ClinicalRAGAgent._search_results_to_chunks(clinical)
+        chunks.extend(memory)
+        return sorted(chunks, key=lambda c: c.relevance_score, reverse=True)[: settings.RAG_RERANK_TOP_N]
 
-        for doc, meta, dist in zip(docs, metas, distances):
-            chunks.append(RetrievedChunk(
-                text=doc,
-                source=meta.get("source", "unknown"),
-                page=meta.get("page"),
-                relevance_score=float(1.0 - dist),   # cosine distance → similarity
-            ))
-        return chunks
+    @staticmethod
+    def _search_results_to_chunks(results: list[SearchResult]) -> list[RetrievedChunk]:
+        return [
+            RetrievedChunk(
+                text=r.text,
+                source=r.source,
+                page=r.page,
+                relevance_score=r.relevance_score,
+                metadata=r.metadata,
+            )
+            for r in results
+        ]
+
+
+_LANG_NAMES = {
+    "en": "English",
+    "ar": "Arabic",
+    "fr": "French",
+    "es": "Spanish",
+}

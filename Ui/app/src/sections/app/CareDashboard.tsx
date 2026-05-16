@@ -1,10 +1,5 @@
-import { useEffect, useState, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import {
-  Calendar,
-  Pill,
-  Sparkles,
-} from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 import { slideInRight, staggerContainer, fadeInUp } from '@/lib/animations';
 import { ScheduleItemComponent } from '@/components/ScheduleItem';
@@ -23,12 +18,6 @@ export function CareDashboard() {
   const addMedication = useAppStore((s) => s.addMedication);
   const addInsight = useAppStore((s) => s.addInsight);
   const [isLoading, setIsLoading] = useState(true);
-  const [newMedId, setNewMedId] = useState<string | null>(null);
-  const [newInsightId, setNewInsightId] = useState<string | null>(null);
-
-  // Track new items for animation
-  const prevMedsLength = useRef(medications.length);
-  const prevInsightsLength = useRef(insights.length);
 
   // Initialize data
   useEffect(() => {
@@ -46,28 +35,6 @@ export function CareDashboard() {
     }, 600);
     return () => clearTimeout(timer);
   }, []);
-
-  // Track new items
-  useEffect(() => {
-    if (medications.length > prevMedsLength.current) {
-      setNewMedId(medications[0]?.id || null);
-      setTimeout(() => setNewMedId(null), 3000);
-    }
-    prevMedsLength.current = medications.length;
-  }, [medications.length]);
-
-  useEffect(() => {
-    if (insights.length > prevInsightsLength.current) {
-      setNewInsightId(insights[0]?.id || null);
-      setTimeout(() => setNewInsightId(null), 3000);
-    }
-    prevInsightsLength.current = insights.length;
-  }, [insights.length]);
-
-  const completedCount = schedule.filter((s) => s.status === 'completed').length;
-  const activeMedications = medications.filter(
-    (m) => m.status === 'on-track' || m.status === 'take-soon'
-  ).length;
 
   return (
     <motion.aside
@@ -94,7 +61,38 @@ export function CareDashboard() {
           >
             {/* Health Insights */}
             <motion.div variants={fadeInUp} className="glass rounded-2xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-nerve-dark">Today's Care</h3>
+                <span className="text-[11px] text-nerve-muted">{schedule.length} tasks</span>
+              </div>
               <div className="space-y-2.5">
+                {schedule.slice(0, 4).map((item) => (
+                  <ScheduleItemComponent key={item.id} item={item} />
+                ))}
+              </div>
+            </motion.div>
+
+            <motion.div variants={fadeInUp} className="glass rounded-2xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-nerve-dark">Medications</h3>
+                <span className="text-[11px] text-nerve-muted">{medications.length} active</span>
+              </div>
+              <div className="space-y-3">
+                {medications.slice(0, 3).map((medication) => (
+                  <MedicationItemComponent key={medication.id} medication={medication} />
+                ))}
+              </div>
+            </motion.div>
+
+            <motion.div variants={fadeInUp} className="glass rounded-2xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-nerve-dark">Insights</h3>
+                <span className="text-[11px] text-nerve-muted">{insights.length} live</span>
+              </div>
+              <div className="space-y-3">
+                {insights.slice(0, 2).map((insight) => (
+                  <InsightCardComponent key={insight.id} insight={insight} />
+                ))}
               </div>
             </motion.div>
           </motion.div>
@@ -108,4 +106,3 @@ export function CareDashboard() {
     </motion.aside>
   );
 }
-

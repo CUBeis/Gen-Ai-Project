@@ -9,6 +9,7 @@ interface AnimatedMessageProps {
 
 export function AnimatedMessage({ message, isRTL }: AnimatedMessageProps) {
   const isUser = message.sender === 'user';
+  const messageIsRTL = isRTL || /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(message.content);
 
   const formatContent = (content: string) => {
     const parts = content.split(/(\*\*.*?\*\*|\\n)/g);
@@ -50,8 +51,11 @@ export function AnimatedMessage({ message, isRTL }: AnimatedMessageProps) {
         )}>
           <p className={cn(
             'text-[15px] leading-relaxed whitespace-pre-wrap',
-            isUser ? 'text-white' : 'text-nerve-dark'
-          )}>
+            isUser ? 'text-white' : 'text-nerve-dark',
+            messageIsRTL && 'text-right'
+          )}
+          dir={messageIsRTL ? 'rtl' : 'ltr'}
+          >
             {formatContent(message.content)}
           </p>
         </div>

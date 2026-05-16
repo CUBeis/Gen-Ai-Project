@@ -34,6 +34,7 @@ from groq import AsyncGroq
 
 from app.agents.base import BaseAgent, llm_retry
 from app.core.exceptions import AgentError
+from app.llm.provider_utils import groq_configured
 
 # ── Blocked response (multilingual) ───────────────────────────────────────────
 _BLOCKED_RESPONSE_EN = (
@@ -105,7 +106,8 @@ class GuardrailAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        self._client = AsyncGroq(api_key=self.settings.GROQ_API_KEY)
+        self._use_groq = groq_configured()
+        self._client = AsyncGroq(api_key=self.settings.GROQ_API_KEY) if self._use_groq else None
         self._model  = self.settings.GROQ_GUARDRAIL_MODEL
 
     async def run(
@@ -158,6 +160,8 @@ class GuardrailAgent(BaseAgent):
         patient_context: dict,
         language: str,
     ) -> GuardrailResult:
+        if not self._use_groq:
+            return self._build_pass(response, intent, language)
 
         audit_prompt = (
             f"RESPONSE TO AUDIT:\n---\n{response}\n---\n\n"

@@ -23,6 +23,8 @@ Design:
 """
 from __future__ import annotations
 
+import time
+
 import structlog
 
 from app.agents.care_planner_agent import CarePlannerAgent
@@ -30,13 +32,15 @@ from app.agents.guardrail_agent import GuardrailAgent, GuardrailAction
 from app.agents.memory_extractor_agent import MemoryExtractorAgent
 from app.agents.onboarding_agent import OnboardingAgent
 from app.agents.rag_agent import ClinicalRAGAgent
-from app.agents.router_agent import RouterAgent, IntentType
+from app.agents.router_agent import RouterAgent
+from app.agents.intents import IntentType
 from app.agents.vision_agent import VisionAgent
 from app.memory.short_term import ShortTermMemory
 from app.orchestrator.retry import pipeline_retry, with_timeout
 from app.orchestrator.state import ConversationState
 from app.core.config import settings
 from app.core.exceptions import AgentError
+from app.tracking.workflow_tracker import workflow_tracker
 
 logger = structlog.get_logger(__name__)
 
@@ -80,8 +84,19 @@ class AgentPipeline:
         Returns:
             (response_text, meta_dict) where meta_dict is state.meta.
         """
+        # Workflow trace (professor visibility)
+        state.workflow_trace_id = workflow_tracker.start(
+            state.session_id, state.user_message
+        )
+        t_router = time.perf_counter()
+
         # Step 1 — Load session history
         history = await self.memory.get_history(state.session_id)
+        workflow_tracker.step(
+            state.workflow_trace_id,
+            "load_session_memory",
+            output_summary={"history_messages": len(history)},
+        )
 
         # Step 2 — Route
         routing = await with_timeout(
@@ -97,6 +112,22 @@ class AgentPipeline:
         state.language           = routing.language
         state.routing_confidence = routing.confidence
 
+        workflow_tracker.update_meta(
+            state.workflow_trace_id,
+            intent=state.intent,
+            language=state.language,
+        )
+        workflow_tracker.step(
+            state.workflow_trace_id,
+            "router_classify",
+            duration_ms=round((time.perf_counter() - t_router) * 1000, 2),
+            output_summary={
+                "intent": state.intent,
+                "confidence": routing.confidence,
+                "language": state.language,
+            },
+        )
+
         logger.info(
             "pipeline.routed",
             session_id=state.session_id,
@@ -106,9 +137,17 @@ class AgentPipeline:
         )
 
         # Step 3 — Dispatch
+        t_dispatch = time.perf_counter()
         raw_response = await self._dispatch(state, history)
+        workflow_tracker.step(
+            state.workflow_trace_id,
+            f"agent_{state.intent}",
+            duration_ms=round((time.perf_counter() - t_dispatch) * 1000, 2),
+            output_summary={"response_preview": raw_response[:120]},
+        )
 
         # Step 4 — Guardrail (mandatory — no exceptions)
+        t_guard = time.perf_counter()
         guard_result = await with_timeout(
             self.guardrail.run(
                 response=raw_response,
@@ -130,6 +169,16 @@ class AgentPipeline:
             state.was_blocked   = guard_result.was_blocked
             final_response      = guard_result.final_response
 
+        workflow_tracker.step(
+            state.workflow_trace_id,
+            "guardrail_audit",
+            duration_ms=round((time.perf_counter() - t_guard) * 1000, 2),
+            output_summary={
+                "was_sanitized": state.was_sanitized,
+                "was_blocked": state.was_blocked,
+            },
+        )
+
         # Step 5 — Update short-term memory
         await self.memory.append(state.session_id, [
             {"role": "user",      "content": state.user_message},
@@ -141,6 +190,14 @@ class AgentPipeline:
         if session_len % settings.MEMORY_EXTRACT_EVERY_N_MESSAGES == 0:
             await self._trigger_memory_extraction(state)
 
+        workflow_tracker.complete(
+            state.workflow_trace_id,
+            response_preview=final_response,
+        )
+        state.workflow_steps = workflow_tracker.get_workflow_summary(
+            state.workflow_trace_id
+        )
+
         logger.info(
             "pipeline.complete",
             session_id=state.session_id,
@@ -148,6 +205,7 @@ class AgentPipeline:
             sanitized=state.was_sanitized,
             blocked=state.was_blocked,
             care_plan_updated=state.care_plan_updated,
+            workflow_trace_id=state.workflow_trace_id,
         )
 
         return final_response, state.meta
@@ -186,6 +244,7 @@ class AgentPipeline:
                 patient_context=state.patient_context,
                 patient_id=state.patient_id,
                 language=state.language,
+                workflow_trace_id=state.workflow_trace_id,
             ),
             timeout_seconds=_TIMEOUTS["rag"],
             label="rag",

@@ -147,6 +147,8 @@ async def websocket_chat_endpoint(websocket: WebSocket, session_id: str) -> None
                 "session_id": session_id,
                 "intent": meta.get("intent"),
                 "sources": meta.get("sources", []),
+                "workflow_trace_id": meta.get("workflow_trace_id"),
+                "workflow_steps": meta.get("workflow_steps", []),
             })
 
             # ── Push care plan update if the planner changed it ───────────────

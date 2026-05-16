@@ -40,6 +40,8 @@ class ChatResponse(BaseModel):
     care_plan_updated: bool = Field(False, description="Whether care plan was modified")
     was_sanitized: bool = Field(False, description="Whether response was sanitized by guardrail")
     was_blocked: bool = Field(False, description="Whether response was blocked by guardrail")
+    workflow_trace_id: Optional[str] = Field(None, description="Pipeline trace ID for professor dashboard")
+    workflow_steps: list[dict] = Field(default_factory=list, description="Step-by-step pipeline log")
 
     class Config:
         json_schema_extra = {

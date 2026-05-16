@@ -44,8 +44,14 @@ async def lifespan(app: FastAPI):
             await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
         logger.info("nerve_ai.db.connected")
     except Exception as exc:
-        logger.error("nerve_ai.db.connection_failed", error=str(exc))
-        raise
+        if settings.is_production:
+            logger.error("nerve_ai.db.connection_failed", error=str(exc))
+            raise
+        logger.warning(
+            "nerve_ai.db.connection_failed",
+            error=str(exc),
+            hint="Start PostgreSQL or update DATABASE_URL in .env",
+        )
 
     # Validate Redis is reachable
     try:
@@ -66,6 +72,27 @@ async def lifespan(app: FastAPI):
         logger.info("nerve_ai.chromadb.ready")
     except Exception as exc:
         logger.warning("nerve_ai.chromadb.init_failed", error=str(exc))
+
+    # Medical RAG index from Rag/ folder (Cohere + hybrid retrieval)
+    try:
+        import chromadb
+        from chromadb.config import Settings as ChromaSettings
+        rag_client = chromadb.PersistentClient(
+            path=settings.rag_chroma_path,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+        rag_client.get_collection(settings.RAG_MEDICAL_COLLECTION)
+        logger.info(
+            "nerve_ai.rag_medical.ready",
+            path=settings.rag_chroma_path,
+            collection=settings.RAG_MEDICAL_COLLECTION,
+        )
+    except Exception as exc:
+        logger.warning(
+            "nerve_ai.rag_medical.init_failed",
+            error=str(exc),
+            hint="Run Rag pipeline: python main.py --pipeline",
+        )
 
     # Optional: init Sentry
     if settings.SENTRY_DSN:
@@ -105,7 +132,7 @@ def create_app() -> FastAPI:
     # ── CORS ──────────────────────────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_origins=settings.allowed_origins_list,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
